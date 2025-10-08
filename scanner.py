@@ -715,4 +715,601 @@ class VulnerabilityScanner:
                     self.add_vuln({
                         "type": "Missing CSRF Protection",
                         "url": form["url"],
-                        "form_on_page": page
+                        "form_on_page": page_url,
+                        "severity": "medium"
+                    })
+                
+                # Test form for XSS
+                data = {}
+                injected_field = None
+                for inp in form["inputs"]:
+                    name = inp["name"]
+                    typ = inp.get("type", "text").lower()
+                    if typ in ["text", "search", "email", "url"] and not injected_field:
+                        data[name] = XSS_PAYLOADS[0]
+                        injected_field = name
+                    else:
+                        data[name] = inp.get("value", "test")
+                
+                if injected_field:
+                    if form["method"] == "get":
+                        q = urllib.parse.urlencode(data)
+                        test_url = form["url"] + ("?" if "?" not in form["url"] else "&") + q
+                        r = self.safe_request(test_url)
+                    else:
+                        r = self.safe_request(form["url"], method="POST", data=data)
+                    
+                    if r.status_code and XSS_PAYLOADS[0] in r.text:
+                        self.add_vuln({
+                            "type": "Form Reflected XSS",
+                            "url": form["url"],
+                            "method": form["method"],
+                            "parameter": injected_field,
+                            "severity": "high"
+                        })
+
+    def check_common_paths(self):
+        for path in COMMON_PATHS:
+            url = urllib.parse.urljoin(self.target_url + "/", path)
+            r = self.safe_request(url)
+            
+            if r.status_code == 200:
+                severity = "high" if any(x in path for x in [".git", ".env", "config", "backup"]) else "medium"
+                self.add_vuln({
+                    "type": "Sensitive File/Directory Exposed",
+                    "url": url,
+                    "path": path,
+                    "severity": severity
+                })
+            elif r.status_code == 403:
+                self.add_vuln({
+                    "type": "Protected Path Found",
+                    "url": url,
+                    "path": path,
+                    "status": 403,
+                    "severity": "info"
+                })
+
+    def check_http_methods(self):
+        # Test various HTTP methods on target
+        methods = ["OPTIONS", "PUT", "DELETE", "TRACE", "PATCH"]
+        
+        for method in methods:
+            r = self.safe_request(self.target_url, method=method)
+            
+            if method == "OPTIONS" and r.status_code == 200:
+                allow = r.headers.get("Allow", "")
+                dangerous = [m for m in ["PUT", "DELETE", "TRACE"] if m in allow]
+                if dangerous:
+                    self.add_vuln({
+                        "type": "Dangerous HTTP Methods Allowed",
+                        "url": self.target_url,
+                        "methods": ", ".join(dangerous),
+                        "severity": "medium"
+                    })
+            
+            if method == "TRACE" and r.status_code == 200:
+                self.add_vuln({
+                    "type": "HTTP TRACE Method Enabled",
+                    "url": self.target_url,
+                    "note": "XST (Cross-Site Tracing) possible",
+                    "severity": "low"
+                })
+            
+            if method in ["PUT", "DELETE"] and r.status_code not in [405, 403, 404]:
+                self.add_vuln({
+                    "type": f"HTTP {method} Method Accepted",
+                    "url": self.target_url,
+                    "status": r.status_code,
+                    "severity": "high"
+                })
+
+    def check_ssl_tls(self):
+        if not self.target_url.startswith("https://"):
+            self.add_vuln({
+                "type": "Insecure Protocol",
+                "url": self.target_url,
+                "note": "Site not using HTTPS",
+                "severity": "high"
+            })
+        else:
+            # Test HTTP version
+            http_url = self.target_url.replace("https://", "http://")
+            r = self.safe_request(http_url, allow_redirects=False)
+            if r.status_code == 200:
+                self.add_vuln({
+                    "type": "HTTP Available Alongside HTTPS",
+                    "url": http_url,
+                    "note": "Site accessible over insecure HTTP",
+                    "severity": "medium"
+                })
+            elif r.status_code not in [301, 302, 307, 308]:
+                self.add_vuln({
+                    "type": "No HTTPS Redirect",
+                    "url": http_url,
+                    "note": "HTTP doesn't redirect to HTTPS",
+                    "severity": "low"
+                })
+
+    def check_api_endpoints(self):
+        for endpoint in self.api_endpoints:
+            # Test for authentication bypass
+            r = self.safe_request(endpoint)
+            if r.status_code == 200:
+                # Check if it returns JSON with sensitive data
+                try:
+                    data = json.loads(r.text)
+                    if isinstance(data, (dict, list)) and data:
+                        self.add_vuln({
+                            "type": "Unauthenticated API Access",
+                            "url": endpoint,
+                            "note": "API endpoint accessible without authentication",
+                            "severity": "high"
+                        })
+                except:
+                    pass
+            
+            # Test for excessive data exposure
+            if "/users" in endpoint.lower() or "/user" in endpoint.lower():
+                self.add_vuln({
+                    "type": "Potential IDOR Vulnerability",
+                    "url": endpoint,
+                    "note": "User endpoint detected - test for IDOR",
+                    "severity": "medium"
+                })
+
+    def analyze_javascript(self):
+        # Analyze collected JS files for sensitive info
+        for js_url in list(self.js_files)[:20]:  # Limit to first 20
+            r = self.safe_request(js_url)
+            if r.status_code != 200:
+                continue
+            
+            # Look for API keys and secrets
+            patterns = {
+                "API Key": r"['\"]?api[_-]?key['\"]?\s*[:=]\s*['\"]([a-zA-Z0-9_\-]{20,})['\"]",
+                "AWS Key": r"(AKIA[0-9A-Z]{16})",
+                "Token": r"['\"]?token['\"]?\s*[:=]\s*['\"]([a-zA-Z0-9_\-\.]{20,})['\"]",
+                "Password": r"['\"]?password['\"]?\s*[:=]\s*['\"]([^'\"]{8,})['\"]"
+            }
+            
+            for name, pattern in patterns.items():
+                matches = re.findall(pattern, r.text, re.I)
+                if matches:
+                    self.add_vuln({
+                        "type": "Hardcoded Secret in JavaScript",
+                        "url": js_url,
+                        "secret_type": name,
+                        "severity": "critical"
+                    })
+            
+            # Look for internal URLs/endpoints
+            internal_urls = re.findall(r'["\']/(api|admin|internal|private)[^"\']{3,50}["\']', r.text)
+            if internal_urls:
+                self.add_vuln({
+                    "type": "Internal Endpoints in JavaScript",
+                    "url": js_url,
+                    "endpoints": len(set(internal_urls)),
+                    "severity": "info"
+                })
+
+    # ---------------------------
+    # Reporting & Export
+    # ---------------------------
+    def generate_summary(self) -> Dict:
+        severity_counts = defaultdict(int)
+        vuln_types = defaultdict(int)
+        
+        for v in self.vulnerabilities:
+            severity_counts[v.get("severity", "info")] += 1
+            vuln_types[v.get("type", "Unknown")] += 1
+        
+        return {
+            "target": self.target_url,
+            "scan_duration": round(time.time() - self.start_time, 2),
+            "urls_scanned": len(self.visited_urls),
+            "forms_found": sum(len(forms) for forms in self.forms.values()),
+            "js_files_found": len(self.js_files),
+            "api_endpoints_found": len(self.api_endpoints),
+            "technologies_detected": list(self.technologies),
+            "total_findings": len(self.vulnerabilities),
+            "severity_breakdown": dict(severity_counts),
+            "vulnerability_types": dict(vuln_types)
+        }
+
+    def export_json(self, path: str):
+        data = {
+            "summary": self.generate_summary(),
+            "vulnerabilities": self.vulnerabilities,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        print(f"[+] JSON report: {path}")
+
+    def export_csv(self, path: str):
+        fields = ["severity", "type", "url", "parameter", "payload", "note", "header", "technology"]
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
+            writer.writeheader()
+            for v in self.vulnerabilities:
+                writer.writerow(v)
+        print(f"[+] CSV report: {path}")
+
+    def export_markdown(self, path: str):
+        summary = self.generate_summary()
+        lines = [
+            f"# Security Scan Report: {self.target_url}\n",
+            f"**Scan Date:** {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}  ",
+            f"**Duration:** {summary['scan_duration']}s  ",
+            f"**URLs Scanned:** {summary['urls_scanned']}  ",
+            f"**Total Findings:** {summary['total_findings']}\n",
+            "## Severity Breakdown\n"
+        ]
+        
+        for severity in ["critical", "high", "medium", "low", "info"]:
+            count = summary["severity_breakdown"].get(severity, 0)
+            if count > 0:
+                lines.append(f"- **{severity.upper()}**: {count}")
+        
+        if summary["technologies_detected"]:
+            lines.append("\n## Technologies Detected\n")
+            lines.append(", ".join(summary["technologies_detected"]))
+        
+        lines.append("\n## Vulnerabilities\n")
+        
+        # Group by severity
+        for severity in ["critical", "high", "medium", "low", "info"]:
+            vulns = [v for v in self.vulnerabilities if v.get("severity") == severity]
+            if vulns:
+                lines.append(f"\n### {severity.upper()} Severity\n")
+                for i, v in enumerate(vulns, 1):
+                    lines.append(f"#### {i}. {v.get('type')}\n")
+                    lines.append("```json")
+                    lines.append(json.dumps(v, indent=2))
+                    lines.append("```\n")
+        
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        print(f"[+] Markdown report: {path}")
+
+    def export_html(self, path: str):
+        summary = self.generate_summary()
+        severity_colors = {
+            "critical": "#d32f2f",
+            "high": "#f44336",
+            "medium": "#ff9800",
+            "low": "#2196f3",
+            "info": "#757575"
+        }
+        
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Security Scan Report - {summary['target']}</title>
+<style>
+body {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+    margin: 0;
+    padding: 20px;
+    background: #f5f5f5;
+}}
+.container {{
+    max-width: 1200px;
+    margin: 0 auto;
+    background: white;
+    padding: 30px;
+    border-radius: 8px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+}}
+h1 {{
+    color: #333;
+    border-bottom: 3px solid #2196f3;
+    padding-bottom: 10px;
+}}
+.summary {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 15px;
+    margin: 20px 0;
+}}
+.summary-card {{
+    background: #f8f9fa;
+    padding: 15px;
+    border-radius: 5px;
+    border-left: 4px solid #2196f3;
+}}
+.summary-card h3 {{
+    margin: 0 0 10px 0;
+    font-size: 14px;
+    color: #666;
+    text-transform: uppercase;
+}}
+.summary-card .value {{
+    font-size: 24px;
+    font-weight: bold;
+    color: #333;
+}}
+.severity-badge {{
+    display: inline-block;
+    padding: 4px 12px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: bold;
+    color: white;
+    text-transform: uppercase;
+    margin-right: 8px;
+}}
+.vuln {{
+    margin: 20px 0;
+    padding: 15px;
+    border-radius: 5px;
+    border-left: 4px solid #ccc;
+    background: #fafafa;
+}}
+.vuln-header {{
+    display: flex;
+    align-items: center;
+    margin-bottom: 10px;
+}}
+.vuln-type {{
+    font-size: 18px;
+    font-weight: bold;
+    color: #333;
+}}
+pre {{
+    background: #263238;
+    color: #aed581;
+    padding: 15px;
+    border-radius: 5px;
+    overflow-x: auto;
+    font-size: 13px;
+}}
+.tech-badge {{
+    display: inline-block;
+    padding: 5px 10px;
+    margin: 5px;
+    background: #e3f2fd;
+    border-radius: 4px;
+    font-size: 12px;
+    color: #1976d2;
+}}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>🔒 Security Scan Report</h1>
+<p><strong>Target:</strong> {summary['target']}</p>
+<p><strong>Scan Date:</strong> {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}</p>
+<p><strong>Duration:</strong> {summary['scan_duration']}s</p>
+
+<div class="summary">
+    <div class="summary-card">
+        <h3>URLs Scanned</h3>
+        <div class="value">{summary['urls_scanned']}</div>
+    </div>
+    <div class="summary-card">
+        <h3>Total Findings</h3>
+        <div class="value">{summary['total_findings']}</div>
+    </div>
+    <div class="summary-card">
+        <h3>Forms Found</h3>
+        <div class="value">{summary['forms_found']}</div>
+    </div>
+    <div class="summary-card">
+        <h3>JS Files</h3>
+        <div class="value">{summary['js_files_found']}</div>
+    </div>
+</div>
+
+<h2>Severity Breakdown</h2>
+<div>
+"""
+        for severity in ["critical", "high", "medium", "low", "info"]:
+            count = summary['severity_breakdown'].get(severity, 0)
+            if count > 0:
+                color = severity_colors.get(severity, "#999")
+                html += f'<span class="severity-badge" style="background:{color}">{severity}: {count}</span>\n'
+        
+        if summary['technologies_detected']:
+            html += "\n<h2>Technologies Detected</h2>\n<div>"
+            for tech in summary['technologies_detected']:
+                html += f'<span class="tech-badge">{tech}</span>'
+            html += "</div>\n"
+        
+        html += "\n<h2>Vulnerabilities</h2>\n"
+        
+        for severity in ["critical", "high", "medium", "low", "info"]:
+            vulns = [v for v in self.vulnerabilities if v.get("severity") == severity]
+            if vulns:
+                html += f"<h3>{severity.upper()} Severity ({len(vulns)})</h3>\n"
+                for v in vulns:
+                    color = severity_colors.get(severity, "#999")
+                    html += f"""
+<div class="vuln" style="border-left-color:{color}">
+    <div class="vuln-header">
+        <span class="severity-badge" style="background:{color}">{v.get('severity', 'info')}</span>
+        <span class="vuln-type">{v.get('type', 'Unknown')}</span>
+    </div>
+    <pre>{json.dumps(v, indent=2)}</pre>
+</div>
+"""
+        
+        html += """
+</div>
+</body>
+</html>"""
+        
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"[+] HTML report: {path}")
+
+    def export_xml(self, path: str):
+        root = ET.Element("security_scan")
+        summary = self.generate_summary()
+        
+        # Summary section
+        sum_elem = ET.SubElement(root, "summary")
+        for key, value in summary.items():
+            if isinstance(value, (str, int, float)):
+                elem = ET.SubElement(sum_elem, key.replace(" ", "_"))
+                elem.text = str(value)
+        
+        # Vulnerabilities section
+        vulns_elem = ET.SubElement(root, "vulnerabilities")
+        for v in self.vulnerabilities:
+            vuln_elem = ET.SubElement(vulns_elem, "vulnerability")
+            for key, value in v.items():
+                elem = ET.SubElement(vuln_elem, key.replace(" ", "_"))
+                elem.text = str(value)
+        
+        tree = ET.ElementTree(root)
+        ET.indent(tree, space="  ")
+        tree.write(path, encoding="utf-8", xml_declaration=True)
+        print(f"[+] XML report: {path}")
+
+    # ---------------------------
+    # Main Orchestration
+    # ---------------------------
+    def run(self, json_path: str = "scan_report.json", html_path: str = None,
+            csv_path: str = None, md_path: str = None, xml_path: str = None):
+        
+        print(colorama.Fore.CYAN + f"\n{'='*70}")
+        print(f"  Advanced Web Vulnerability Scanner v3.0")
+        print(f"  Target: {self.target_url}")
+        print(f"  Max Depth: {self.max_depth} | Workers: {self.max_workers}")
+        print(f"  Aggressive Mode: {'ON' if self.aggressive else 'OFF'}")
+        print(f"{'='*70}\n" + colorama.Style.RESET_ALL)
+        
+        # Discovery phase
+        print(colorama.Fore.YELLOW + "[*] Phase 1: Discovery & Crawling" + colorama.Style.RESET_ALL)
+        self.discover_robots_sitemap()
+        self.crawl_site()
+        
+        # Active scanning phase
+        print(colorama.Fore.YELLOW + "\n[*] Phase 2: Active Vulnerability Scanning" + colorama.Style.RESET_ALL)
+        
+        urls = list(self.visited_urls)
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = []
+            
+            # Per-URL checks
+            for url in urls:
+                futures.append(executor.submit(self.check_xss, url))
+                futures.append(executor.submit(self.check_sqli, url))
+                futures.append(executor.submit(self.check_open_redirect, url))
+                if self.aggressive:
+                    futures.append(executor.submit(self.check_ssrf, url))
+                    futures.append(executor.submit(self.check_path_traversal, url))
+                    futures.append(executor.submit(self.check_command_injection, url))
+                    futures.append(executor.submit(self.check_xxe, url))
+            
+            # Global checks
+            futures.append(executor.submit(self.check_forms))
+            futures.append(executor.submit(self.check_common_paths))
+            futures.append(executor.submit(self.check_http_methods))
+            futures.append(executor.submit(self.check_ssl_tls))
+            futures.append(executor.submit(self.check_api_endpoints))
+            futures.append(executor.submit(self.analyze_javascript))
+            
+            # Wait for completion
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    pass
+        
+        # Generate reports
+        print(colorama.Fore.YELLOW + "\n[*] Phase 3: Generating Reports" + colorama.Style.RESET_ALL)
+        
+        self.export_json(json_path)
+        if html_path:
+            self.export_html(html_path)
+        if csv_path:
+            self.export_csv(csv_path)
+        if md_path:
+            self.export_markdown(md_path)
+        if xml_path:
+            self.export_xml(xml_path)
+        
+        # Print summary
+        summary = self.generate_summary()
+        print(colorama.Fore.GREEN + f"\n{'='*70}")
+        print("  SCAN COMPLETE")
+        print(f"{'='*70}")
+        print(f"  URLs Scanned: {summary['urls_scanned']}")
+        print(f"  Total Findings: {summary['total_findings']}")
+        print(f"  Duration: {summary['scan_duration']}s")
+        print(f"\n  Severity Breakdown:")
+        for sev in ["critical", "high", "medium", "low"]:
+            count = summary['severity_breakdown'].get(sev, 0)
+            if count > 0:
+                color = {
+                    "critical": colorama.Fore.RED,
+                    "high": colorama.Fore.LIGHTRED_EX,
+                    "medium": colorama.Fore.YELLOW,
+                    "low": colorama.Fore.CYAN
+                }.get(sev, colorama.Fore.WHITE)
+                print(f"  {color}{sev.upper()}: {count}{colorama.Style.RESET_ALL}")
+        print(f"{'='*70}\n" + colorama.Style.RESET_ALL)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Advanced Web Vulnerability Scanner v3.0",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  Basic scan:     python advanced_scanner_v3.py https://example.com
+  Deep scan:      python advanced_scanner_v3.py https://example.com --depth 3 --workers 15
+  Aggressive:     python advanced_scanner_v3.py https://example.com --aggressive
+  Full reports:   python advanced_scanner_v3.py https://example.com --html report.html --csv report.csv --md report.md
+        """
+    )
+    
+    parser.add_argument("target", help="Target URL (e.g., https://example.com)")
+    parser.add_argument("--depth", type=int, default=2, help="Crawl depth (default: 2)")
+    parser.add_argument("--workers", type=int, default=10, help="Thread pool size (default: 10)")
+    parser.add_argument("--timeout", type=int, default=10, help="HTTP timeout in seconds (default: 10)")
+    parser.add_argument("--rate", type=float, default=0.0, help="Rate limit between requests (default: 0)")
+    parser.add_argument("--aggressive", action="store_true", help="Enable aggressive scanning (SSRF, time-based SQLi, etc.)")
+    parser.add_argument("--report", default="scan_report.json", help="JSON report path")
+    parser.add_argument("--html", help="HTML report path")
+    parser.add_argument("--csv", help="CSV report path")
+    parser.add_argument("--md", help="Markdown report path")
+    parser.add_argument("--xml", help="XML report path")
+    
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    
+    if not args.target.startswith(("http://", "https://")):
+        print(colorama.Fore.RED + "[!] Target must start with http:// or https://" + colorama.Style.RESET_ALL)
+        sys.exit(1)
+    
+    scanner = VulnerabilityScanner(
+        target_url=args.target,
+        max_depth=args.depth,
+        max_workers=args.workers,
+        timeout=args.timeout,
+        rate_limit=args.rate,
+        aggressive=args.aggressive
+    )
+    
+    try:
+        scanner.run(
+            json_path=args.report,
+            html_path=args.html,
+            csv_path=args.csv,
+            md_path=args.md,
+            xml_path=args.xml
+        )
+    except KeyboardInterrupt:
+        print(colorama.Fore.YELLOW + "\n[!] Interrupted by user. Generating partial reports..." + colorama.Style.RESET_ALL)
+        scanner.export_json(args.report)
+        if args.html:
+            scanner.export_html(args.html)
+        sys.exit(0)
